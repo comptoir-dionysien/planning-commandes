@@ -273,6 +273,64 @@
     font-size: 13px; color: var(--text-muted);
     font-style: italic; margin-bottom: 4px;
   }
+
+  /* Rangée jours de livraison LMMJVS */
+  .order-producer { cursor: pointer; user-select: none; }
+  .order-producer:hover { text-decoration: underline; text-decoration-style: dotted; text-underline-offset: 4px; }
+  .week-days-row {
+    display: flex; gap: 4px; align-items: center;
+    margin: 8px 0 6px;
+    overflow: hidden;
+    max-height: 0;
+    transition: max-height 0.18s ease-out, margin 0.18s ease-out;
+  }
+  .week-days-row.expanded {
+    max-height: 60px;
+    margin: 8px 0 8px;
+  }
+  .week-day-cell {
+    width: 38px; height: 36px;
+    display: flex; flex-direction: column;
+    align-items: center; justify-content: center;
+    font-size: 11px; font-weight: 600;
+    border-radius: 6px;
+    background: #f0f0eb;
+    color: var(--text-faint);
+    border: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .week-day-cell.active {
+    background: var(--accent);
+    color: white;
+    border-color: var(--accent);
+  }
+  .week-day-cell.crossed {
+    background: #c8c8c0;
+    color: #6a6a64;
+    border-color: #b0b0a8;
+    text-decoration: line-through;
+    text-decoration-color: rgba(0,0,0,0.5);
+  }
+  .week-day-cell.clickable {
+    cursor: pointer;
+    transition: transform .08s, box-shadow .12s;
+  }
+  .week-day-cell.clickable:hover {
+    box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+  }
+  .week-day-cell.clickable:active {
+    transform: scale(0.95);
+  }
+  .week-day-cell .wd-letter {
+    font-size: 13px; line-height: 1;
+  }
+  .week-day-cell .wd-date {
+    font-size: 9px; line-height: 1; margin-top: 2px;
+    opacity: 0.85;
+  }
+  @media (max-width: 720px) {
+    .week-day-cell { width: 36px; height: 38px; }
+  }
   .order-meta {
     display: flex; gap: 14px; font-size: 13px; color: var(--text-muted);
     flex-wrap: wrap;
@@ -753,6 +811,7 @@
     </div>
     <div class="header-actions">
       <button id="slackBtn" class="ghost internal-only" title="Envoyer le résumé du jour sur Slack">↗ Slack</button>
+      <button id="exportLivraisonsBtn" class="ghost internal-only" title="Exporter les livraisons en CSV">⤓ CSV</button>
       <button id="modeToggleBtn" class="ghost">Mode interne</button>
       <button id="exportBtn" class="ghost icon" title="Exporter les données">⇩</button>
       <button id="importBtn" class="ghost icon" title="Importer des données">⇪</button>
@@ -7473,6 +7532,131 @@ function resolveDeliveryDay(producer, week) {
   };
 }
 
+// Renvoie un tableau de 6 éléments (lun..sam) pour un producteur dans une semaine
+// Chaque élément : { active: bool, crossed: bool, producerId: string|null }
+function getProducerWeekDays(producerName, week) {
+  const result = [
+    { active: false, crossed: false, producerId: null },
+    { active: false, crossed: false, producerId: null },
+    { active: false, crossed: false, producerId: null },
+    { active: false, crossed: false, producerId: null },
+    { active: false, crossed: false, producerId: null },
+    { active: false, crossed: false, producerId: null },
+  ];
+  if (!week) return result;
+  // Trouver toutes les entrées avec ce nom
+  const sameName = week.producers.filter(p =>
+    (p.name || "").toLowerCase() === (producerName || "").toLowerCase()
+  );
+  sameName.forEach(p => {
+    const delivery = resolveDeliveryDay(p, week);
+    let dayIdx = null;
+    if (delivery.dayIndex !== null && delivery.dayIndex !== undefined && delivery.dayIndex >= 0 && delivery.dayIndex <= 5) {
+      dayIdx = delivery.dayIndex;
+    } else if (delivery.date) {
+      // Date custom : convertir en index 0-5 (lundi-samedi)
+      const d = new Date(delivery.date);
+      // Vérifier que c'est dans la semaine du week
+      if (week.startDate) {
+        const start = new Date(week.startDate);
+        start.setHours(0,0,0,0);
+        const end = new Date(start);
+        end.setDate(start.getDate() + 5);
+        end.setHours(23,59,59,999);
+        if (d >= start && d <= end) {
+          const dow = (d.getDay() + 6) % 7; // dim=0 → 6 ; lun=1 → 0
+          if (dow >= 0 && dow <= 5) dayIdx = dow;
+        }
+      }
+    }
+    if (dayIdx !== null) {
+      const status = computeStatus(p, week);
+      result[dayIdx].active = true;
+      result[dayIdx].crossed = (status === "crossed");
+      // On garde l'id de la 1ère entrée (utile pour suppression)
+      if (!result[dayIdx].producerId) result[dayIdx].producerId = p.id;
+    }
+  });
+  return result;
+}
+
+// Crée une nouvelle livraison pour un producteur à un jour donné
+function createProducerDeliveryForDay(producerName, week, dayIdx) {
+  if (!week) return;
+  // Chercher dans la semaine si on a déjà une entrée pour ce producteur (pour cloner)
+  const existing = week.producers.find(p =>
+    (p.name || "").toLowerCase() === (producerName || "").toLowerCase()
+  );
+  let template;
+  if (existing) {
+    // Cloner la 1ère entrée existante
+    template = { ...existing };
+    delete template.id;
+    delete template.status;
+    delete template.orderDayDate;
+    delete template.deliveryDayDate;
+  } else {
+    // Créer depuis le référentiel
+    const ref = findProducerInRef(producerName);
+    if (!ref) {
+      toast("Producteur inconnu");
+      return;
+    }
+    template = {
+      name: ref.name,
+      category: ref.category || "",
+      specialty: ref.specialty || "",
+      pickup: ref.pickup || null,
+      palette: ref.palette || null,
+      weight: ref.weight || null,
+      transporter: ref.transporter || null,
+      defaultStatus: ref.defaultStatus || "upcoming",
+      orderDay: "",
+      deliveryDay: "",
+      carrierNotified: false
+    };
+  }
+  // Définir le jour de livraison
+  template.deliveryDay = DAY_NAMES[dayIdx];
+  template.deliveryDayDate = null;
+  // Garder le jour de commande s'il existe, sinon vide
+  if (!template.orderDay) template.orderDay = "";
+  // Statut hérité du défaut
+  template.status = template.defaultStatus || "upcoming";
+  // Nouvel ID
+  template.id = uid();
+  week.producers.push(template);
+  save();
+  toast(`${producerName} ajouté en livraison ${DAY_LABELS[DAY_NAMES[dayIdx]]}`);
+}
+
+// Supprime la livraison d'un producteur à un jour donné
+function deleteProducerDeliveryForDay(producerName, week, dayIdx) {
+  if (!week) return;
+  const targetDayName = DAY_NAMES[dayIdx];
+  // Trouver l'entrée avec ce producteur ET ce jour de livraison
+  const idx = week.producers.findIndex(p => {
+    if ((p.name || "").toLowerCase() !== (producerName || "").toLowerCase()) return false;
+    const delivery = resolveDeliveryDay(p, week);
+    if (delivery.dayIndex === dayIdx) return true;
+    // Date custom dans la semaine ?
+    if (delivery.date) {
+      const d = new Date(delivery.date);
+      const dow = (d.getDay() + 6) % 7;
+      if (dow === dayIdx) return true;
+    }
+    return false;
+  });
+  if (idx === -1) {
+    toast("Livraison introuvable");
+    return;
+  }
+  if (!confirm(`Supprimer la livraison ${producerName} du ${DAY_LABELS[targetDayName]} ?`)) return;
+  week.producers.splice(idx, 1);
+  save();
+  toast("Livraison supprimée");
+}
+
 // État du producteur — basé sur defaultStatus, modifiable au clic
 function computeStatus(producer, week) {
   // Renvoie 'upcoming' (rouge) | 'ready' (blanc/vert) | 'done' (bleu)
@@ -7824,15 +8008,57 @@ function renderOrderCard(producer, week, forcedStatus) {
   const specialtyHtml = producer.specialty
     ? `<div class="order-specialty">${escapeHtml(producer.specialty)}</div>`
     : "";
+  // Rangée des jours de livraison de la semaine pour ce producteur
+  const weekDays = getProducerWeekDays(producer.name, week);
+  let weekDaysHtml = '<div class="week-days-row" data-producer="' + escapeHtml(producer.name) + '">';
+  for (let i = 0; i < 6; i++) {
+    const dayInfo = weekDays[i];
+    const dayDate = week ? getDayDate(week, i) : null;
+    const classes = ["week-day-cell"];
+    if (dayInfo.active) classes.push(dayInfo.crossed ? "crossed" : "active");
+    if (state.mode === "internal") classes.push("clickable");
+    const letter = ["L","M","M","J","V","S"][i];
+    const dateStr = dayDate ? formatDateShort(dayDate) : "";
+    weekDaysHtml += `<div class="${classes.join(' ')}" data-day="${i}" data-active="${dayInfo.active ? 1 : 0}">`
+      + `<span class="wd-letter">${letter}</span>`
+      + (dateStr ? `<span class="wd-date">${dateStr.split('/').slice(0,2).join('/')}</span>` : '')
+      + `</div>`;
+  }
+  weekDaysHtml += '</div>';
+
   main.innerHTML = `
     <div class="order-producer">${escapeHtml(producer.name)}</div>
     ${specialtyHtml}
+    ${weekDaysHtml}
     <div class="order-meta">
       <span><span class="label">À commander</span> ${escapeHtml(order.label)}</span>
       <span><span class="label">Livraison</span> ${escapeHtml(delivery.label)}</span>
       <span class="status-badge ${status}">${statusLabels[status] || status}</span>
     </div>
   `;
+
+  // Clic sur le nom du producteur = déplie/replie la rangée
+  const nameEl = main.querySelector('.order-producer');
+  const rowEl = main.querySelector('.week-days-row');
+  nameEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    rowEl.classList.toggle('expanded');
+  });
+  // Empêcher le clic sur les cases d'éclater jusqu'à la card
+  rowEl.addEventListener('click', (e) => {
+    e.stopPropagation();
+    if (state.mode !== "internal") return;
+    const cell = e.target.closest('.week-day-cell');
+    if (!cell) return;
+    const dayIdx = parseInt(cell.dataset.day, 10);
+    const isActive = cell.dataset.active === "1";
+    if (isActive) {
+      deleteProducerDeliveryForDay(producer.name, week, dayIdx);
+    } else {
+      createProducerDeliveryForDay(producer.name, week, dayIdx);
+    }
+    render();
+  });
 
   // Bloc interne
   if (state.mode === "internal") {
@@ -8402,6 +8628,186 @@ async function sendToSlack() {
     sendBtn.textContent = originalLabel;
     sendBtn.disabled = false;
   }
+}
+
+// ============================================================
+// EXPORT CSV LIVRAISONS
+// ============================================================
+const CSV_TEMPLATE_NAMES = ["ALTERNOO Normandie - Champ Secret", "ALTERNOO Normandie - Ferme de Grohan", "ALTERNOO Normandie - Ferme de la Mare Cavelière", "ALTERNOO Normandie - Ferme de la Mi-Voie", "ALTERNOO Normandie - GAEC Malo", "ALTERNOO Normandie - GAEC des Mondrots", "ALTERNOO Normandie - Jardin de Simone", "ALTERNOO Normandie - Laurent Moinet", "ALTERNOO Normandie - Les Oeufs de la Porte Verte", "ALTERNOO Normandie - Thibault Georges", "Alexandre Coulange", "Alimentation Géniale STOCK", "Aliméria - ex Alimea", "Alternative Bio", "Andrea Calek", "Anthony Domestici", "Arc en Ciel Bakery", "Archipel", "Arto Gorria", "Atelier de la Pépie", "Aux Saveurs du Quercy", "Azade", "BIOGARONNE", "Baptiste Cousin", "Bascule !", "Beaudoin", "Belazkabieta", "Belsia", "Benoît Le Joubioux", "Berghman", "Bio Pays Landais", "Biosiculà", "Bières des Régions - L'Agrivoise", "Bières des Régions - Les Gens Sérieux", "Bières des Régions - Pleine Lune", "Brasserie Mir", "Brasserie du Grand Paris", "Breizhine", "Buru Beltza", "Carotte Aimable STOCK", "Casabonita", "Caves de Savoie", "Cellar Masroig", "Champagne Fleury", "Champagne Météyer Père et fils", "Champicarde", "Charcuterie du Viala", "Choucrouterie Meyer-Wagner", "Christophe Louie", "Château Hostin Le Roc", "Château Le Puy", "Château d'Or et de Gueules", "Chèvrerie de Beauregard", "Cidrerie du Golfe", "Clairieres d’Uther", "Clos de Verdelot", "Cocotte Gourmande", "Comptoir Dionysien", "Comptoir dionysien STOCK", "Conservatoire de l'Abeille Noire de l'Orne", "Coopérative IDF", "Culinare", "Delicefig", "Des Fermes Un Quartier STOCK", "Distillerie de la Plaine", "Distribution Services", "Dohatsu", "Domaine Chaillou", "Domaine Fay d'Homme", "Domaine Giachino", "Domaine Hélène Bleuzen", "Domaine Regnier", "Domaine Richaud", "Domaine de l'Ecu", "Domaine de la Mer Blanche", "Domaine des Essarts", "Domaine des Vigneaux", "Domaine du Mazel", "Domaine la Cendrillon", "Dumas-Prunier", "EARL Ginouguier", "EARL Serradimigni", "Ecailles & Compagnie", "Ecopagesos", "Ekitopi", "Extracepes", "Fabien Legendre", "Faso'Die A SUPPR", "Ferme Brès", "Ferme Elizaldia", "Ferme Frieh", "Ferme Haranea", "Ferme La Roselle", "Ferme Milpas", "Ferme Mûre", "Ferme de Fontaine", "Ferme de Kerhors", "Ferme de Kersanté", "Ferme de Lanset", "Ferme de Mesenguy", "Ferme de la Haute Folie", "Ferme de la Luciole", "Ferme des Arnaud", "Ferme des Charmettes", "Ferme des Evoissons", "Ferme du Basilou - Vincent Lerat", "Ferme du Colombier", "Filles d'ici", "Fleuve de Liens", "Font Bernard", "Fontaine à pains du Porhoët", "François Saint-Lô", "Fratelli Brugnoli", "Fromagerie Bonal", "Fromagerie Le Vézou", "Fromagerie Loiseau", "Fromagerie Reo", "Fromagerie de Montriveau", "Fromagerie d’Entrammes", "Fromaville", "Fruitière Les Fins", "Frères Jonquères", "GAEC Cambon", "GAEC Domaine de la  BAROTTE", "GAEC du Vend'Ouest", "GAEC la Belle Roche", "Galdis", "Galline Felici", "Gilles Troullier", "Grégory Guillaume", "Guillaume Noire", "Guy Atger", "Hautimagnes", "Herba Humana", "Horizon des bastides", "Houmous Jo", "Hubert Corpet", "Huitric", "Iroma", "Janette Boudoir", "Jardin de la Testa", "Jardins de Cilou", "Jeff Coutelou", "Jennifer Bariou & Thibaut Bodet", "Joseph Deschamps", "Julien Rousselot", "Jérémie Valadié", "Jérémy Durand", "Karim Vionnet", "Kedelaï", "Kléber Nègre", "Kura", "L'Epicuroise (ex Ferme Possien)", "L'Oreille d'Orme", "La Belle Façon", "La Bilouterie", "La Chanteracoise", "La Clef de Fer", "La Compagnie bretonne", "La Confiserie d'Antan", "La Ferme Mamet", "La Ferme de la Bigottière", "La Ferme de la Pépinière", "La Ferme des Volonteux", "La Ferme du Bois Suzin", "La Ferme du Relais", "La Fontaine du Muletier", "La Fontude", "La Forestière du Champignon", "La Grange de Noue Méa", "La Larme à l'Oeil", "La Pastourelle", "La Petite Abeille de Normandie", "La Petite Sauvageonne", "La Plantation", "La Route des Comptoirs", "La Sauge", "La Umbría Ibérico Ecológico", "Langevine", "Laurence & Rémi Dufaitre", "Le Barouillet", "Le Courtil Goulipaou", "Le Jardin du Bastarn", "Le Moulin du Chely", "Le Pain d'Hervé", "Le Raisin et l'Ange", "Le Verger de Conques", "Le champ de l'âme", "Legumes de l'Omignon", "Lemon Pie", "Les Accoles", "Les Bio oeufs de l'Abbaye", "Les Bières de Belleville", "Les Bois Perdus", "Les Bons Plants d'Elise", "Les Brebis de Cravent", "Les Cabrioles de Balajou", "Les Délices de l'Ogresse", "Les Délices de la Fleurette", "Les Fromages de Stéphanie EURL", "Les Fruitières de Suchaux", "Les Fumaisons de l'Ile de Groix", "Les Jardins de Brière", "Les Jardins de Gaïa", "Les Jardins de Priape", "Les Jardins de Riez", "Les Petits Evaurys", "Les Potagers de Marcoussis", "Les Saloirs de Louis", "Les Vergers de Kergoal", "Les Viandes du Chateauneuf", "Les Voisins bio", "Local en bocal", "Léonine", "MERLIN Brewing Company", "Maison Conquet", "Maison Marie Séverac", "Maison Maris", "Marché Super STOCK", "Marcotte SCOP", "Mas Gouredon", "Mas d'Intras", "Mas du Mouton Noir", "Mathéo Chastel", "Matthew Charlton", "Mirabio", "Montirius", "Moulin du Traquet Pâtre", "Moulin à Huile de Saint Céré", "Nardin", "Naturellement Normande", "Nicolas Mariotti", "Nolaim", "Obis", "Océane Alimentaire", "Omafrida", "Ozil Frangins", "PDS - Agrucorse", "PDS - Alternative Bio", "PDS - André Aude", "PDS - Armand Combe", "PDS - Carle Fruit", "PDS - David Szymanski", "PDS - EARL La Treille", "PDS - Fabien Dijon", "PDS - Jerome Ayme", "PDS - Les Jardins bio de Martine", "PDS - Les Moulières", "PDS - Les Producteurs du Sud", "PDS - Mas Daussan", "PDS - Vert Tige bio", "Papiers service", "Papilles Sauvages", "Patrimoniam", "Paul Barlet", "Paysans d'Avignon", "Paysans d'Avignon - Damien Baillet", "Paysans d'Avignon - Hélène Bertrand", "Paysans d'Avignon - La Perdrigone", "Paysans d'Avignon - Olivier Bougé", "Paysans d'Avignon - SCOP Des Pieds et des Mains", "Philippe Viret", "Pink Sun Brewing", "Pirate Cannerie", "Pisciculture de Villette", "Pur Perche", "Pâte feuilletée François", "Raphaël Faure", "Raymond Daman", "Rouxel", "SARL ALTERNOO", "SARL de l'Écu", "SCEA Huitric", "Saint Jean de l'Isle", "Salaisons Bouhéret", "Salaisons Marion", "Santinell", "Savonnerie Aubergine", "Scarlette Le Corre", "Sojaterie Gentil·le", "Sylvère Trichard", "Terramica", "Terre Adélice", "Terre des Ayous", "Thomas Guiblain", "Tierra y Libertad", "Umà", "Val Primbert", "Verger de la Dagueneterie", "Vert Coquelicot", "Vincent Canova", "Ça coule de source"];
+const CSV_ALIASES = {"ARTO GORIA": "Arto Gorria", "PÂTES FRANCOIS": "Pâte feuilletée François", "ECAILLES & CIE": "Ecailles & Compagnie", "FORESTIERE": "La Forestière du Champignon", "BASILOU / Vincent LERAT": "Ferme du Basilou - Vincent Lerat", "BASILOU": "Ferme du Basilou - Vincent Lerat", "DELICES DE LA FLEURETTE / YOAN BEX": "Délices de la Fleurette / Yoan Bex", "DELICES DE LA FLEURETTE": "Délices de la Fleurette / Yoan Bex", "EPICUROISE (POSSIEN)": "L'Epicuroise (ex Ferme Possien)", "EPICUROISE": "L'Epicuroise (ex Ferme Possien)", "FUMAISONS DE GROIX": "Les Fumaisons de l'Ile de Groix", "FUMAISONS": "Les Fumaisons de l'Ile de Groix", "TIERRA Y LIBERTAD bananes": "Tierra y Libertad", "BILOUTERIE oeufs": "La Bilouterie", "FERME DE LA PEPINIÈRE": "Les Bio oeufs de l'Abbaye", "JARDINS DE PRIAPE": "Les Jardins de Priape", "PRODUCTEURS DU SUD": "PDS - Les Producteurs du Sud"};
+
+function csvNormalize(s) {
+  if (!s) return "";
+  return s.toString().toLowerCase()
+    .normalize("NFD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .replace(/\s+/g, " ");
+}
+
+const CSV_STOPWORDS = new Set(['de','la','le','les','des','du','et','pour','normandie','ferme','gaec','sas','sarl','eurl']);
+
+function csvKeywords(s, minLen = 3) {
+  return new Set(csvNormalize(s).split(' ').filter(w => w.length >= minLen && !CSV_STOPWORDS.has(w)));
+}
+
+// Matche un nom de l'app contre les noms du template
+// Retourne la liste des indices template correspondants
+function matchAppToTemplate(appName) {
+  if (!appName) return [];
+  const matches = [];
+  // Match alias manuel d'abord (priorité)
+  if (CSV_ALIASES[appName]) {
+    const aliasTarget = CSV_ALIASES[appName];
+    const idx = CSV_TEMPLATE_NAMES.findIndex(t => t === aliasTarget);
+    if (idx >= 0) return [idx];
+  }
+  const appNorm = csvNormalize(appName);
+  const appKw = csvKeywords(appName);
+  if (appKw.size === 0) return [];
+
+  // Match exact (normalisé)
+  CSV_TEMPLATE_NAMES.forEach((t, i) => {
+    if (csvNormalize(t) === appNorm) matches.push(i);
+  });
+  if (matches.length > 0) return matches;
+
+  // Match keyword (tous les mots-clés app dans template ou inverse)
+  CSV_TEMPLATE_NAMES.forEach((t, i) => {
+    const tKw = csvKeywords(t);
+    if (tKw.size === 0) return;
+    const intersect = [...appKw].filter(k => tKw.has(k));
+    if (intersect.length === 0) return;
+    // Tous les mots-clés de l'un sont dans l'autre
+    if (intersect.length === appKw.size || intersect.length === tKw.size) {
+      matches.push(i);
+    }
+  });
+  return matches;
+}
+
+// Format date FR JJ/MM/AAAA
+function csvFormatDate(date) {
+  const d = new Date(date);
+  if (isNaN(d.getTime())) return "";
+  const dd = String(d.getDate()).padStart(2, "0");
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  return `${dd}/${mm}/${d.getFullYear()}`;
+}
+
+function exportLivraisonsCsv() {
+  // 1. Collecter toutes les dates de livraison uniques sur toutes les semaines
+  const allDeliveries = new Map(); // dateISO → Set(appNames)
+  state.weeks.forEach(week => {
+    week.producers.forEach(p => {
+      // Ignorer les barrés (status crossed)
+      const st = computeStatus(p, week);
+      if (st === "crossed") return;
+      const delivery = resolveDeliveryDay(p, week);
+      if (!delivery.date) return;
+      const d = new Date(delivery.date);
+      d.setHours(0,0,0,0);
+      const isoKey = d.toISOString().slice(0,10);
+      if (!allDeliveries.has(isoKey)) allDeliveries.set(isoKey, new Set());
+      allDeliveries.get(isoKey).add(p.name);
+    });
+  });
+
+  if (allDeliveries.size === 0) {
+    toast("Aucune livraison à exporter");
+    return;
+  }
+
+  // 2. Trier les dates dans l'ordre chronologique
+  const sortedDateKeys = [...allDeliveries.keys()].sort();
+  const sortedDates = sortedDateKeys.map(k => new Date(k));
+
+  // 3. Pour chaque ligne du template : déterminer si elle est active à chaque date
+  // Parcourir TOUS les producteurs de l'app, les associer aux index template
+  const templateActivation = CSV_TEMPLATE_NAMES.map(() => sortedDateKeys.map(() => 0));
+
+  // Collecter tous les noms producteurs uniques de l'app
+  const allAppNames = new Set();
+  state.weeks.forEach(w => w.producers.forEach(p => {
+    if (p.name) allAppNames.add(p.name);
+  }));
+
+  // Pour chaque nom app, trouver ses indices template
+  const appNameToTemplateIndices = new Map();
+  const unmatchedAppNames = new Set();
+  allAppNames.forEach(name => {
+    const indices = matchAppToTemplate(name);
+    if (indices.length > 0) {
+      appNameToTemplateIndices.set(name, indices);
+    } else {
+      unmatchedAppNames.add(name);
+    }
+  });
+
+  // Remplir templateActivation
+  sortedDateKeys.forEach((dateKey, dateIdx) => {
+    const appNamesThisDay = allDeliveries.get(dateKey);
+    appNamesThisDay.forEach(appName => {
+      const tIndices = appNameToTemplateIndices.get(appName);
+      if (tIndices) {
+        tIndices.forEach(ti => { templateActivation[ti][dateIdx] = 1; });
+      }
+    });
+  });
+
+  // Construire les lignes pour les producteurs non matchés
+  const unmatchedRows = [];
+  [...unmatchedAppNames].sort().forEach(name => {
+    const row = sortedDateKeys.map(dateKey => {
+      const appNamesThisDay = allDeliveries.get(dateKey);
+      return appNamesThisDay.has(name) ? 1 : 0;
+    });
+    unmatchedRows.push({ name, row });
+  });
+
+  // 4. Construire le CSV (séparateur ;)
+  function csvCell(v) {
+    const s = String(v);
+    if (s.includes('"') || s.includes(';') || s.includes('\n')) {
+      return '"' + s.replace(/"/g, '""') + '"';
+    }
+    return '"' + s + '"';
+  }
+
+  let csv = "";
+  // En-tête
+  const headerCells = ["Dénomination fournisseur", ...sortedDates.map(d => csvFormatDate(d))];
+  csv += headerCells.map(csvCell).join(';') + '\n';
+
+  // Lignes du template
+  CSV_TEMPLATE_NAMES.forEach((tname, ti) => {
+    const cells = [tname, ...templateActivation[ti].map(v => String(v))];
+    csv += cells.map(csvCell).join(';') + '\n';
+  });
+
+  // Lignes des producteurs non matchés (séparateur visuel)
+  if (unmatchedRows.length > 0) {
+    // Ligne vide commentaire
+    const sep = ['--- Producteurs non matchés (ajoutés depuis l\'app) ---', ...sortedDateKeys.map(() => '')];
+    csv += sep.map(csvCell).join(';') + '\n';
+    unmatchedRows.forEach(({ name, row }) => {
+      const cells = [name, ...row.map(v => String(v))];
+      csv += cells.map(csvCell).join(';') + '\n';
+    });
+  }
+
+  // 5. Téléchargement
+  // BOM UTF-8 pour Excel
+  const blob = new Blob(['\ufeff' + csv], { type: "text/csv;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  const today = new Date();
+  const ts = today.toISOString().slice(0,10).replace(/-/g, "");
+  a.download = `livraisons_${ts}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+  toast(`Export : ${sortedDates.length} jour(s), ${CSV_TEMPLATE_NAMES.length} fournisseurs + ${unmatchedRows.length} hors template`);
 }
 
 async function copySlackText() {
@@ -9000,6 +9406,7 @@ document.getElementById("rs_value").addEventListener("keydown", (e) => {
 
 // Slack
 document.getElementById("slackBtn").onclick = openSlackModal;
+document.getElementById("exportLivraisonsBtn").onclick = exportLivraisonsCsv;
 document.getElementById("cancelSlackBtn").onclick = closeSlackModal;
 document.getElementById("sendSlackBtn").onclick = sendToSlack;
 document.getElementById("copySlackBtn").onclick = copySlackText;
